@@ -114,13 +114,8 @@ def Alam(lamin, A_v=1, R_v=3.1):
     to find the constant of proportionality for
     the extinction law.
     """
-
-    flux = np.ones(len(lamin))
-    flux = [float(x) for x in flux]
-    lamin = np.array([float(i) for i in lamin])
-    redreturn = apply(extinction.ccm89(lamin, A_v, R_v), flux)
-
-    return redreturn
+    lamin = np.asarray(lamin, dtype=float)
+    return extinction.ccm89(lamin, A_v, R_v)
 
 
 def error_obj(kind, lam, object_to_fit):
@@ -312,7 +307,7 @@ def core(
         dd = d[idx[0]][idx[1]]
         sn_flux = sn[0, idx[1], :]
         gal_flux = gal[idx[0], 0, :]
-        sn_cont = bb * np.nanmean(sn_flux * 10 ** (-0.4 * extcon * Alam(lam)))
+        sn_cont = bb * np.nanmean(sn_flux)
         gal_cont = dd * np.nanmean(gal_flux)
         sum_cont = sn_cont + gal_cont
         sn_cont = sn_cont / sum_cont

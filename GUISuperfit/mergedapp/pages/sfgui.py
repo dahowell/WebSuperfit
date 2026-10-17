@@ -378,11 +378,11 @@ sn_checklist = dbc.Card(
     dbc.CardBody(
         [
             _sn_accordion(),
-                html.Label(
-                    "Epoch Range",
-                    style={"fontWeight": "bold"},
-                    className="mb-0",
-                    ),
+            html.Label(
+                "Epoch Range",
+                style={"fontWeight": "bold"},
+                className="mb-0",
+            ),
             dcc.RangeSlider(
                 id="sfgui-epoch-range",
                 min=-100,
@@ -490,7 +490,8 @@ sn_checklist = dbc.Card(
 spectrum_graph = dcc.Graph(
     id="sfgui-graph",
     config={"displayModeBar": False, "responsive": True},
-    style={"height": "60vh"},
+    responsive=True,
+    style={"width": "100%", "height": "450px", "minWidth": 0},
 )
 
 resolution_control = html.Div(
@@ -647,6 +648,7 @@ layout = html.Div(
                         dbc.Col(
                             dbc.Card(dbc.CardBody([spectrum_graph, resolution_control, wavelength_slider])),
                             md=7,
+                            style={"minWidth": 0},
                         ),
                     ],
                     className="mt-3 sf-main-row",
@@ -893,6 +895,13 @@ def upload_file(contents, filename):
             True,
         )
 
+    parsed_path = (UPLOAD_DIR / saved_name).with_name("parsed_observation.dat")
+    temporary = parsed_path.with_suffix(".tmp")
+    df[["wavelength", "flux"]].to_csv(
+        temporary, sep=" ", header=False, index=False, float_format="%.17g"
+    )
+    os.replace(temporary, parsed_path)
+
     wmin = float(df["wavelength"].min())
     wmax = float(df["wavelength"].max())
     status = html.Span(
@@ -905,7 +914,7 @@ def upload_file(contents, filename):
 
     return (
         status,
-         saved_name,
+        saved_name,
         {
             "wavelength": df["wavelength"].astype(float).tolist(),
             "flux": df["flux"].astype(float).tolist(),
@@ -984,6 +993,7 @@ def update_graph(df_json, wave_range, theme, wave_bounds, resolution, filename):
     domain_lo, domain_hi = _coerce_wave_bounds(wave_bounds)
 
     fig = go.Figure()
+
     fig.update_layout(
         template="plotly_dark" if dark else "plotly_white",
         paper_bgcolor=paper,
@@ -1080,6 +1090,18 @@ def update_graph(df_json, wave_range, theme, wave_bounds, resolution, filename):
                 line=dict(width=2.5, color=line_col),
             )
         )
+
+    fig.update_layout(
+        autosize=True,
+        margin=dict(l=65, r=15, t=20, b=55),
+        legend=dict(
+            orientation="h",
+            x=0,
+            xanchor="left",
+            y=1.02,
+            yanchor="bottom",
+        ),
+    )
 
     return fig
 
@@ -1202,6 +1224,21 @@ def start_fit(n, z_known, z1, z2, dz, sn_types, epoch_range,
             True,
         )
 
+    try:
+        relative = Path(filename)
+        if relative.is_absolute() or len(relative.parts) != 3 or relative.parts[0] != "uploads":
+            raise ValueError("Please upload the spectrum again.")
+        if str(uuid.UUID(relative.parts[1])) != relative.parts[1]:
+            raise ValueError("Invalid upload ID.")
+        parsed_source = (UPLOAD_DIR / relative).with_name("parsed_observation.dat").resolve()
+        if not parsed_source.is_relative_to((UPLOAD_DIR / "uploads").resolve()):
+            raise ValueError("Invalid upload path.")
+        if not parsed_source.is_file():
+            raise ValueError("Please upload the spectrum again to create its parsed data.")
+    except (TypeError, ValueError, AttributeError) as exc:
+        return (None, True, 0, "", False, {"display": "none"}, str(exc),
+                {"display": "inline-block"}, {"display": "none"}, False)
+
     run_id = str(uuid.uuid4())
     run_dir = RESULTS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -1210,6 +1247,13 @@ def start_fit(n, z_known, z1, z2, dz, sn_types, epoch_range,
     stdout_path = run_dir / f"run_{run_id}.log"
     stderr_path = run_dir / f"run_{run_id}.err"
 
+    observation_path = run_dir / "observation.dat"
+    try:
+        shutil.copyfile(parsed_source, observation_path)
+    except OSError as exc:
+        return (None, True, 0, "", False, {"display": "none"},
+                f"Cannot prepare the spectrum: {exc}",
+                {"display": "inline-block"}, {"display": "none"}, False)
     _write_progress(progress_path, 0, "Starting fit")
 
     params = _build_params(
@@ -1219,12 +1263,15 @@ def start_fit(n, z_known, z1, z2, dz, sn_types, epoch_range,
         resolution=resolution,
         progress_path=str(progress_path),results_dir=run_dir,
     )
+    params["object_to_fit"] = str(observation_path)
 
     _row_show  = {"display": "block"}
     _run_hide  = {"display": "none"}
     _stop_show = {"display": "inline-block"}
 
     try:
+        with (run_dir / "parameters.json").open("w") as config_file:
+            json.dump(params, config_file, indent=2)
         stdout_f = open(stdout_path, "w")
         stderr_f = open(stderr_path, "w")
         proc = subprocess.Popen(

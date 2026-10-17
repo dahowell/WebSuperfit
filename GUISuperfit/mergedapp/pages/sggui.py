@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import uuid
 
@@ -9,6 +10,7 @@ import dash_bootstrap_components as dbc
 from dash import dcc, html, dash_table, Input, Output, State, callback
 import plotly.graph_objs as go
 import extinction
+import io
 from extinction import apply
 
 dash.register_page(__name__, path="/sggui")
@@ -19,14 +21,18 @@ DEFAULT_NGSF_DIR = PROJECT_ROOT / "NGSF"
 
 NGSF_BASE = Path(os.environ.get("NGSF_DIR", str(DEFAULT_NGSF_DIR))).resolve()
 RESULTS_DIR = Path(os.environ.get("NGSF_RESULTS_DIR", str(NGSF_BASE / "results"))).resolve()
+UPLOAD_DIR = Path(os.environ.get("NGSF_UPLOAD_DIR", str(NGSF_BASE))).resolve()
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 RESULT_COLUMNS = [
-    "SPECTRUM", "GALAXY", "SN", "CONST_SN", "CONST_GAL",
+    "SPECTRUM", "SN", "GALAXY", "CONST_SN", "CONST_GAL",
     "Z", "A_v", "Phase", "Band",
     "Frac(SN)", "Frac(gal)", "CHI2/dof", "CHI2/dof2", "sn_name",
 ]
-TABLE_COLUMNS = [c for c in RESULT_COLUMNS if c != "sn_name"]
+TABLE_COLUMNS = [
+    c for c in RESULT_COLUMNS
+    if c not in ("sn_name", "SPECTRUM")
+]
 
 COLUMN_ALIASES = {
     "CONST SN": "CONST_SN",
@@ -85,11 +91,103 @@ def _under_root(root: Path, p, *extra_roots: Path):
     return root / target
 
 
-def find_latest_csv_in(folder: Path):
-    if not folder.exists():
+def find_results_csv(run_id):
+    try:
+        run_id = str(uuid.UUID(run_id))
+    except (ValueError, TypeError, AttributeError):
         return None
-    files = sorted(folder.glob("*.csv"), key=lambda q: q.stat().st_mtime, reverse=True)
-    return files[0] if files else None
+    folder = (RESULTS_DIR / run_id).resolve()
+    if folder.parent != RESULTS_DIR or not folder.is_dir():
+        return None
+    for path in sorted(folder.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if path.resolve().parent != folder:
+            continue
+        try:
+            columns = pd.read_csv(path, nrows=0).columns.str.strip()
+            if {"SPECTRUM", "SN", "CHI2/dof2"}.issubset(columns):
+                return path
+        except (OSError, ValueError, pd.errors.ParserError):
+            continue
+    return None
+
+def read_run_resolution(csv_filename):
+    """Use the fitting resolution, independent of display-only rebinning."""
+    run_dir = Path(csv_filename).resolve().parent
+    if run_dir.parent != RESULTS_DIR or str(uuid.UUID(run_dir.name)) != run_dir.name:
+        raise ValueError("Invalid run directory")
+    with (run_dir / "parameters.json").open() as config_file:
+        params = json.load(config_file)
+    resolution = float(params.get("resolution", 10))
+    if not np.isfinite(resolution) or resolution <= 0:
+        raise ValueError("Invalid fitting resolution")
+    return resolution
+
+
+def resolve_observation_path(csv_path, value):
+    csv_path = Path(csv_path).resolve()
+    run_dir = csv_path.parent
+    try:
+        if run_dir.parent != RESULTS_DIR or str(uuid.UUID(run_dir.name)) != run_dir.name:
+            return None
+    except ValueError:
+        return None
+    observation = (run_dir / "observation.dat").resolve()
+    return observation if observation.parent == run_dir and observation.is_file() else None
+
+@callback(
+    Output("sggui-results-data", "data"),
+    Output("sggui-results-path", "data"),
+    Output("sggui-table", "data"),
+    Output("sggui-table", "columns"),
+    Output("sggui-table", "selected_rows"),
+    Input("run-flag", "data"),
+    prevent_initial_call=False,
+)
+def load_results(run_flag):
+    if not isinstance(run_flag, dict) or run_flag.get("action") != "run":
+        return _empty_results_response()
+
+    try:
+        run_id = str(uuid.UUID(run_flag["run_id"]))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return _empty_results_response()
+
+    latest = find_results_csv(run_id)
+    if latest is None:
+        return _empty_results_response()
+
+    try:
+        df = ensure_columns(pd.read_csv(latest))
+    except (OSError, ValueError, pd.errors.ParserError):
+        return _empty_results_response()
+
+    if df.empty:
+        return _empty_results_response()
+
+    df["CHI2/dof2"] = pd.to_numeric(
+        df["CHI2/dof2"], errors="coerce"
+    )
+
+    df = df.sort_values(
+        "CHI2/dof2",
+        ascending=True,
+        na_position="last",
+    ).reset_index(drop=True)
+
+    table_df = df[TABLE_COLUMNS].round(3)
+    table_df["CHI2/dof2"] = df["CHI2/dof2"].round(5)
+    table_df = table_df.astype(object).where(pd.notna(table_df), None)
+
+    columns = [{"name": c, "id": c} for c in TABLE_COLUMNS]
+    data = table_df.to_dict("records")
+
+    return (
+        df.to_json(orient="split"),
+        str(latest),
+        data,
+        columns,
+        [0] if data else [],
+    )
 
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -105,13 +203,18 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_two_col_txt(path: Path) -> pd.DataFrame:
-    try:
-        df = pd.read_csv(path, delim_whitespace=True, header=None)
-    except Exception:
-        df = pd.read_csv(path, header=None)
-    df = df.select_dtypes(include="number").iloc[:, :2]
-    df.columns = ["wav", "flux"]
-    return df.dropna().sort_values("wav").reset_index(drop=True)
+    rows = []
+    for line in path.read_text(errors="replace").splitlines():
+        parts = line.strip().replace(",", " ").split()
+        if len(parts) < 2:
+            continue
+        try:
+            rows.append((float(parts[0]), float(parts[1])))
+        except ValueError:
+            continue
+    df = pd.DataFrame(rows, columns=["wav", "flux"])
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+    return df.sort_values("wav").reset_index(drop=True)
 
 
 def normalize_flux(df: pd.DataFrame) -> pd.DataFrame:
@@ -125,9 +228,8 @@ def normalize_flux(df: pd.DataFrame) -> pd.DataFrame:
 
 def alam(wavelength, A_v=1.0, R_v=3.1):
     wavelength = np.asarray(wavelength, dtype=float)
-    unit_flux = np.ones(wavelength.size, dtype=float)
     return np.asarray(
-        apply(extinction.ccm89(wavelength, A_v, R_v), unit_flux),
+        extinction.ccm89(wavelength, A_v, R_v),
         dtype=float,
     )
 
@@ -358,7 +460,25 @@ results_table = dash_table.DataTable(
     row_selectable="single",
     selected_rows=[],
     style_header={"fontWeight": "bold", "textAlign": "center"},
-    style_cell={"padding": "4px", "fontSize": "12px"},
+    style_cell={
+    "padding": "4px",
+    "fontSize": "12px",
+    "textAlign": "center",
+    "minWidth": "60px",
+    "width": "75px",
+    "maxWidth": "110px",
+    "overflow": "hidden",
+    "textOverflow": "ellipsis",
+    },
+    style_cell_conditional=[
+        {
+            "if": {"column_id": "SN"},
+            "textAlign": "left",
+            "minWidth": "100px",
+            "width": "100px",
+            "maxWidth": "350px",
+        },
+    ],
     style_table={"width": "100%", "overflowX": "auto", "border": "thin lightgrey solid"},
 )
 
@@ -407,49 +527,8 @@ layout = html.Div(
 )
 
 
-@callback(
-    Output("sggui-results-data", "data"),
-    Output("sggui-results-path", "data"),
-    Output("sggui-table", "data"),
-    Output("sggui-table", "columns"),
-    Output("sggui-table", "selected_rows"),
-    Input("run-flag", "data"),
-    prevent_initial_call=False,
-)
-def load_results(run_flag):
-    if not isinstance(run_flag, dict) or run_flag.get("action") != "run":
-        return _empty_results_response()
 
-    try:
-        run_id = str(uuid.UUID(run_flag.get("run_id", "")))
-    except (ValueError, TypeError, AttributeError):
-        return _empty_results_response()
 
-    if run_id != run_flag.get("run_id"):
-        return _empty_results_response()
-
-    latest = find_latest_csv_in(RESULTS_DIR / run_id)
-    if latest is None:
-        return _empty_results_response()
-
-    try:
-        df = pd.read_csv(latest)
-    except Exception:
-        return _empty_results_response()
-
-    df = ensure_columns(df)
-    sort_cols = [c for c in ["CHI2/dof", "CHI2/dof2"] if c in df.columns]
-    if sort_cols:
-        df = df.sort_values(by=sort_cols, ascending=True, kind="mergesort")
-
-    table_cols = [c for c in df.columns if c != "sn_name"]
-    table_df = df[table_cols].copy()
-    table_df = table_df.round(3)
-    columns = [{"name": c, "id": c} for c in table_cols]
-    data = table_df.to_dict("records")
-    selected = [0] if data else []
-
-    return df.to_json(orient="split"), str(latest), data, columns, selected
 
 @callback(
     Output("sggui-download-csv-button", "disabled"),
@@ -480,7 +559,7 @@ def download_results_csv(n_clicks, table_data, table_columns):
 
     return dcc.send_data_frame(
         df.to_csv,
-        "galaxy_spectrum_match.csv",
+        "sn_galaxy_spectrum_match.csv",
         index=False,
     )
 
@@ -492,20 +571,21 @@ def download_results_csv(n_clicks, table_data, table_columns):
     Input("sggui-bin", "value"),
     Input("theme-store", "data"),
     State("sggui-table", "data"),
-    State("sggui-results-data", "data"),
+    Input("sggui-results-data", "data"),
+    State("sggui-results-path", "data"),
     State("sggui-last-figure", "data"),
 )
-def plot_selected(sel_rows, plot_flags, bin_size, theme, table_data, json_data, stored_fig):
+def plot_selected(sel_rows, plot_flags, bin_size, theme, table_data, json_data, csv_filename, stored_fig):
     dark = theme == "dark"
 
     if not sel_rows or not table_data or not json_data:
-        fig, fig_dict = _fallback_figure(stored_fig, dark)
+        fig, fig_dict = _fallback_figure(None, dark)
         return fig, fig_dict
 
     if plot_flags is None:
         plot_flags = _ALL_PLOT_VALUES
 
-    df_all = pd.read_json(json_data, orient="split")
+    df_all = pd.read_json(io.StringIO(json_data), orient="split")
     selected_index = sel_rows[0]
     if selected_index >= len(df_all):
         selected_index = 0
@@ -541,12 +621,25 @@ def plot_selected(sel_rows, plot_flags, bin_size, theme, table_data, json_data, 
         _record(clean["flux"].to_numpy(dtype=float))
         traces_added = True
 
-    obs_path = _under_root(RESULTS_DIR, row.get("SPECTRUM"), NGSF_BASE)
+    obs_path = resolve_observation_path(Path(csv_filename), row.get("SPECTRUM")) if csv_filename else None
     gal_rel = None if pd.isna(row.get("GALAXY")) else str(row.get("GALAXY"))
-    gal_path = (
-        NGSF_BASE / "bank" / "binnings" / "10A" / "gal" / gal_rel
-        if gal_rel else None
-    )
+    gal_path = None
+    if gal_rel:
+        try:
+            fit_resolution = read_run_resolution(csv_filename)
+        except (OSError, ValueError, TypeError, AttributeError):
+            fig.add_annotation(
+                text="Run parameters missing or invalid. Start a new fit with the updated input page.",
+                x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+            return fig, fig.to_dict()
+        galaxy_folder = NGSF_BASE / "bank" / "binnings" / f"{fit_resolution:g}A" / "gal"
+        gal_path = galaxy_folder / gal_rel
+        if not gal_path.is_file():
+            print(f"[sggui] Galaxy template missing: {gal_path}")
+            fig.add_annotation(
+                text=f"Galaxy template unavailable for the fit resolution ({fit_resolution:g} Å).",
+                x=0.5, y=1, xref="paper", yref="paper", showarrow=False)
+
     sn_path = _under_root(NGSF_BASE, row.get("sn_name"))
 
     redshift = _safe_float(row.get("Z"))
@@ -582,8 +675,11 @@ def plot_selected(sel_rows, plot_flags, bin_size, theme, table_data, json_data, 
             obs_plot = obs_plot.replace([np.inf, -np.inf], np.nan).dropna()
 
     if obs_plot is None or obs_plot.empty:
-        fig, fig_dict = _fallback_figure(stored_fig, dark)
-        return fig, fig_dict
+        print(f"[sggui] Observation file not found or empty: {row.get('SPECTRUM')!r} (CSV: {csv_filename})")
+        fig = _base_figure(dark)
+        fig.add_annotation(text="Saved observation missing or empty. Upload the spectrum again and start a new fit.",
+                           x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        return fig, fig.to_dict()
 
     plot_wavelength = obs_plot["wav"].to_numpy(dtype=float)
     gal_scaled = None
@@ -635,7 +731,7 @@ def plot_selected(sel_rows, plot_flags, bin_size, theme, table_data, json_data, 
     _add_trace("omg", observation_minus_galaxy, "Observation − Galaxy")
 
     if not traces_added:
-        fig, fig_dict = _fallback_figure(stored_fig, dark)
+        fig, fig_dict = _fallback_figure(None, dark)
         return fig, fig_dict
 
     if y_extents:
@@ -652,12 +748,12 @@ def plot_selected(sel_rows, plot_flags, bin_size, theme, table_data, json_data, 
 @callback(
     Output("sggui-bestfit", "children"),
     Input("sggui-table", "selected_rows"),
-    State("sggui-results-data", "data"),
+    Input("sggui-results-data", "data"),
 )
 def update_bestfit(sel_rows, json_data):
     if not json_data:
         return ""
-    df_all = pd.read_json(json_data, orient="split")
+    df_all = pd.read_json(io.StringIO(json_data), orient="split")
     idx = sel_rows[0] if sel_rows else 0
     if idx >= len(df_all):
         idx = 0
@@ -668,7 +764,6 @@ def update_bestfit(sel_rows, json_data):
     z = _fmt_float(row.get("Z"), nd=4)
     av = _fmt_float(row.get("A_v"), nd=2)
     frac_sn = _fmt_pct(row.get("Frac(SN)"))
-    chi = _fmt_float(row.get("CHI2/dof"), nd=2)
 
     def _line(label, value):
         return html.Div(
@@ -683,7 +778,6 @@ def update_bestfit(sel_rows, json_data):
             _line("Redshift (z): ", z),
             _line("Extinction (A_v): ", av),
             _line("SN Contribution: ", frac_sn),
-            _line("Chi-squared: ", chi),
         ]
     )
 
@@ -696,7 +790,7 @@ def toggle_bestfit_display(json_data):
     if not json_data:
         return {"display": "none"}
     try:
-        df = pd.read_json(json_data, orient="split")
+        df = pd.read_json(io.StringIO(json_data), orient="split")
     except Exception:
         return {"display": "none"}
     return {"display": "block"} if not df.empty else {"display": "none"}
